@@ -13,6 +13,8 @@ namespace GHelper.Gpu
         public static int gpuMode;
         public static bool? gpuExists = null;
 
+        static bool nvRestartPending;
+
 
         public GPUModeControl(SettingsForm settingsForm)
         {
@@ -32,6 +34,16 @@ namespace GHelper.Gpu
 
             Logger.WriteLine("Eco flag : " + eco);
             Logger.WriteLine("Mux flag : " + mux);
+
+            if (eco == 1 && HardwareControl.GpuControl?.IsValid == true)
+            {
+                Logger.WriteLine("Eco half-state");
+                if (AppConfig.IsEcoBootFix())
+                {
+                    HardwareControl.DisposeGpuControl();
+                    Task.Run(() => Program.acpi.DeviceSet(AsusACPI.GPUEco, eco, "GPUEco Force Fix"));
+                }
+            }
 
             settings.VisualiseGPUButtons(eco >= 0, mux >= 0);
 
@@ -173,17 +185,27 @@ namespace GHelper.Gpu
 
                     if (eco == 0)
                     {
-                        await Task.Delay(TimeSpan.FromMilliseconds(AppConfig.Get("nv_delay", 5000)));
-
                         if (AppConfig.IsNVPlatform())
                         {
+                            settings.LockGPUModes(Properties.Strings.GPUMode +": Restarting NV Services...");
+                            await Task.Delay(TimeSpan.FromMilliseconds(AppConfig.Get("nv_delay", 5000)));
                             NvidiaGpuControl.RestartNVService();
+                            settings.Invoke(delegate { InitGPUMode(); });
                             await Task.Delay(TimeSpan.FromMilliseconds(1000));
-                        } else {
-                            NvidiaGpuControl.FixNvContainer();
+                        } else if (nvRestartPending) {
+                            settings.LockGPUModes(Properties.Strings.GPUMode +": Restarting NV Service...");
+                            await Task.Delay(TimeSpan.FromMilliseconds(AppConfig.Get("nv_delay", 5000)));
+                            NvidiaGpuControl.RestartNvContainer();
+                            nvRestartPending = false;
+                            settings.Invoke(delegate { InitGPUMode(); });
                         }
 
-                        HardwareControl.RecreateGpuControl();
+                        for (int i = 0; i < 3; i++)
+                        {
+                            HardwareControl.RecreateGpuControl();
+                            if (HardwareControl.GpuControl is not null) break;
+                            await Task.Delay(TimeSpan.FromSeconds(2));
+                        }
                         Program.modeControl.SetGPUClocks(false);
                     }
 
@@ -321,6 +343,11 @@ namespace GHelper.Gpu
             {
                 HardwareControl.GpuControl.KillGPUApps();
             }
+        }
+
+        public void CaptureNvBootState()
+        {
+            nvRestartPending = Program.acpi.DeviceGet(AsusACPI.GPUEco) == 1;
         }
 
         public void StandardModeFix()

@@ -242,6 +242,7 @@ namespace GHelper
             sliderBattery.MouseUp += SliderBattery_MouseUp;
             sliderBattery.KeyUp += SliderBattery_KeyUp;
             sliderBattery.ValueChanged += SliderBattery_ValueChanged;
+            if (AppConfig.IsChargeLimit6080()) sliderBattery.supportedValues = new() { 60, 65, 70, 75, 80, 100 };
 
             sensorTimer = new System.Timers.Timer(AppConfig.Get("sensor_timer", 1000));
             sensorTimer.Elapsed += OnTimedEvent;
@@ -693,11 +694,14 @@ namespace GHelper
             sensorTimer.Enabled = this.Visible || sensorsAlways;
             if (this.Visible)
             {
-                ScreenControl.InitScreen();
-                VisualizeXGM();
-                buttonEnergySaver.Visible = PowerNative.GetBatterySaverStatus();
                 Task.Run((Action)RefreshPeripheralsBattery);
                 updateControl.CheckForUpdates();
+                BeginInvoke(new Action(() =>
+                {
+                    ScreenControl.InitScreen();
+                    VisualizeXGM();
+                    buttonEnergySaver.Visible = PowerNative.GetBatterySaverStatus();
+                }));
             }
         }
 
@@ -740,6 +744,13 @@ namespace GHelper
                 m.Result = (IntPtr)1;
             }
 
+            if (m.Msg == NativeMethods.WM_POWERBROADCAST && m.WParam == (IntPtr)NativeMethods.PBT_APMRESUMEAUTOMATIC)
+            {
+                Logger.WriteLine("System Resume");
+                BatteryControl.AutoBattery();
+                m.Result = (IntPtr)1;
+            }
+
             if (m.Msg == NativeMethods.WM_POWERBROADCAST && m.WParam == (IntPtr)NativeMethods.PBT_POWERSETTINGCHANGE)
             {
                 var settings = (NativeMethods.POWERBROADCAST_SETTING)m.GetLParam(typeof(NativeMethods.POWERBROADCAST_SETTING));
@@ -749,6 +760,7 @@ namespace GHelper
                     {
                         case 0:
                             Logger.WriteLine("Lid Closed");
+                            BatteryControl.AutoBattery();
                             InputDispatcher.lidClose = AniMatrixControl.lidClose = true;
                             Aura.ApplyBrightness(0, "Lid");
                             matrixControl.SetLidMode();
@@ -770,10 +782,12 @@ namespace GHelper
                         case 0:
                             Logger.WriteLine("Monitor Power Off");
                             Aura.SleepBrightness();
+                            Program.hardwareOverlay?.SuspendForDisplayOff();
                             break;
                         case 1:
                             Logger.WriteLine("Monitor Power On");
                             if (!Program.SetAutoModes(wakeup: true)) BatteryControl.AutoBattery();
+                            Program.hardwareOverlay?.ResumeForDisplayOn();
                             break;
                         case 2:
                             Logger.WriteLine("Monitor Dimmed");
@@ -873,11 +887,18 @@ namespace GHelper
 
             contextMenuStrip.Items.Add("-");
 
-            var menuOverlay = new ToolStripMenuItem("Hardware Overlay");
+            var menuOverlay = new ToolStripMenuItem(Properties.Strings.Overlay);
             menuOverlay.Click += (sender, args) => ToggleOverlay();
             menuOverlay.Margin = padding;
-            menuOverlay.Checked = AppConfig.Is("overlay");
+            menuOverlay.Checked = AppConfig.IsOverlay();
             contextMenuStrip.Items.Add(menuOverlay);
+
+            var menuOverlayGameOnly = new ToolStripMenuItem(Properties.Strings.OverlayOnlyInGames);
+            menuOverlayGameOnly.Click += (sender, args) => ToggleOverlayGameOnly();
+            menuOverlayGameOnly.Margin = padding;
+            menuOverlayGameOnly.Checked = AppConfig.IsOverlayGameOnly();
+            menuOverlayGameOnly.Enabled = AppConfig.IsOverlay();
+            contextMenuStrip.Items.Add(menuOverlayGameOnly);
 
             var quit = new ToolStripMenuItem(Properties.Strings.Quit);
             quit.Click += ButtonQuit_Click;
@@ -1388,8 +1409,9 @@ namespace GHelper
 
 
 
-        public void VisualiseScreen(bool screenEnabled, bool screenAuto, int frequency, int maxFrequency, int overdrive, bool overdriveSetting, int miniled1, int miniled2, bool hdr, int fhd, int hdrControl)
+        public void VisualiseScreen(bool screenEnabled, bool screenAuto, int frequency, int maxFrequency, int overdrive, bool overdriveSetting, int miniled1, int miniled2, bool hdr, bool acm, int fhd, int hdrControl)
         {
+            bool advancedColor = hdr || acm;
 
             ButtonEnabled(button60Hz, screenEnabled);
             ButtonEnabled(button120Hz, screenEnabled);
@@ -1399,6 +1421,8 @@ namespace GHelper
             labelSreen.Text = screenEnabled
                 ? Properties.Strings.LaptopScreen + ": " + frequency + "Hz" + ((overdrive == 1) ? " + " + Properties.Strings.Overdrive : "")
                 : Properties.Strings.LaptopScreen + ": " + Properties.Strings.TurnedOff;
+
+            panelScreen.AccessibleName = labelSreen.Text;
 
             button60Hz.Activated = false;
             button120Hz.Activated = false;
@@ -1488,10 +1512,10 @@ namespace GHelper
                 buttonHDRControl.Visible = false;
             }
 
-            if (hdr) labelVisual.Text = Properties.Strings.VisualModesHDR;
+            if (advancedColor) labelVisual.Text = Properties.Strings.VisualModesHDR;
             if (!screenEnabled) labelVisual.Text = Properties.Strings.VisualModesScreen;
 
-            if (!screenEnabled || hdr)
+            if (!screenEnabled || advancedColor)
             {
                 labelVisual.Location = tableVisual.Location;
                 labelVisual.Width = tableVisual.Width;
@@ -1608,7 +1632,7 @@ namespace GHelper
             string charge = "";
 
             await Task.Run(() => HardwareControl.ReadSensors());
-            Task.Run((Action)PeripheralsProvider.RefreshBatteryForAllDevices);
+            if (Visible) Task.Run((Action)PeripheralsProvider.RefreshBatteryForAllDevices);
 
             if (HardwareControl.cpuTemp > 0)
                 cpuTemp = ": " + TempHelper.FormatTemp((double)HardwareControl.cpuTemp);
@@ -1662,14 +1686,30 @@ namespace GHelper
                 fansForm.LabelFansResult(text);
         }
 
-        public void ToggleOverlay()
+        public void ToggleOverlay(bool fromHotkey = false)
         {
-            bool enable = !AppConfig.Is("overlay");
+            bool enable = !AppConfig.IsOverlay();
             AppConfig.Set("overlay", enable ? 1 : 0);
+            Logger.WriteLine("Overlay " + (enable ? "On" : "Off") + (AppConfig.IsOverlayGameOnly() ? " (game only)" : ""));
             if (enable)
                 Program.hardwareOverlay?.StartOverlay();
             else
                 Program.hardwareOverlay?.StopOverlay();
+
+            if (fromHotkey && AppConfig.IsOverlayGameOnly())
+                Program.toast.RunToast(Properties.Strings.Overlay + " " + (enable ? Properties.Strings.On : Properties.Strings.Off));
+
+            SetContextMenu();
+        }
+
+        public void ToggleOverlayGameOnly()
+        {
+            AppConfig.Set("overlay_game_only", AppConfig.IsOverlayGameOnly() ? 0 : 1);
+            if (AppConfig.IsOverlay())
+            {
+                Program.hardwareOverlay?.StopOverlay();
+                Program.hardwareOverlay?.StartOverlay();
+            }
             SetContextMenu();
         }
 
